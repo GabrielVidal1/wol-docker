@@ -1,7 +1,8 @@
 import asyncio
 import os
-import signal
+import sys
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import httpx
 import uvicorn
@@ -11,7 +12,8 @@ from fastapi.responses import JSONResponse
 
 # Configuration from environment variables
 MAC_ADDRESS = os.getenv("MAC_ADDRESS")
-HEALTH_URL = os.getenv("HEALTH_URL")
+HEALTH_URL = os.getenv("HEALTH_URL")  # e.g., "http://192.168.1.50/api/health"
+TARGET_URL = os.getenv("TARGET_URL", HEALTH_URL)  # default to HEALTH_URL if not set
 MAX_TIMEOUT = float(os.getenv("MAX_TIMEOUT", "30"))  # Default: 30 seconds
 PORT = int(os.getenv("PORT", "8000"))
 HOST = os.getenv("HOST", "0.0.0.0")
@@ -41,6 +43,60 @@ def log(message: str):
     print(f"[{ts}] {message}", flush=True)
 
 
+def parse_url_with_port(url_str: str) -> dict:
+    """
+    Parse a URL and return components with explicit port (or None if not present).
+    Handles both `http://host` and `http://host:port`.
+    Returns: {'scheme':..., 'hostname':..., 'path':..., 'query':..., 'port': int|None}
+    """
+    try:
+        parsed = urlparse(url_str)
+        scheme = parsed.scheme or "http"
+        hostname = parsed.hostname
+        # Default ports: 80 for http, 443 for https — but we keep port=None if omitted in URL.
+        port = parsed.port
+        path = parsed.path or "/"
+        query = parsed.query
+
+        return {
+            "scheme": scheme,
+            "hostname": hostname,
+            "port": port,  # e.g., 8080, or None if not specified
+            "path": path.rstrip("/")
+            or "/",  # ensure trailing slash is handled consistently
+            "query": query,
+        }
+    except Exception as e:
+        raise ValueError(f"Invalid URL: {url_str} ({e})")
+
+
+def build_url_from_parts(parts: dict) -> str:
+    """Reconstruct URL from parsed parts, handling port and path correctly."""
+    scheme = parts["scheme"]
+    hostname = parts["hostname"]
+    path = parts["path"].rstrip("/") or "/"
+
+    # Port is only included if explicitly set
+    host_with_port = f"{hostname}:{parts['port']}" if parts.get("port") else hostname
+
+    # Rebuild without trailing slash in path (except root)
+    return f"{scheme}://{host_with_port}{path}"
+
+
+# Pre-parse URLs at startup to catch errors early and avoid per-request parsing
+try:
+    _health_parsed = parse_url_with_port(HEALTH_URL) if HEALTH_URL else None
+    _target_parsed = parse_url_with_port(TARGET_URL) if TARGET_URL else None
+
+    # Warn if health or target missing critical fields
+    for name, parts in [("HEALTH_URL", _health_parsed), ("TARGET_URL", _target_parsed)]:
+        if not parts or not parts["hostname"]:
+            raise ValueError(f"{name} is invalid: must contain a hostname")
+except Exception as e:
+    log(f"❌ Critical URL parse error: {e}")
+    sys.exit(1)
+
+
 async def poll_health():
     """
     Poll `HEALTH_URL` every POLL_INTERVAL seconds.
@@ -50,12 +106,13 @@ async def poll_health():
     global target_is_up
     global target_last_checked_at
 
-    log(f"Starting health poll loop for {HEALTH_URL}")
+    health_url = build_url_from_parts(_health_parsed)
+    log(f"Starting health poll loop for {health_url}")
 
     while not shutdown_event.is_set():
         try:
             async with httpx.AsyncClient(timeout=2.0) as short_client:
-                resp = await short_client.get(HEALTH_URL)
+                resp = await short_client.get(health_url)
                 if 200 <= resp.status_code < 400:
                     if not target_is_up:
                         log("✅ Target is now UP (health check passed)")
@@ -93,7 +150,9 @@ async def ensure_target_woken():
             kwargs = {}
             if WOL_INTERFACE:
                 kwargs["interface"] = WOL_INTERFACE
-            wakeonlan.send_magic_packet(MAC_ADDRESS, ip_address=WOL_HOST, port=WOL_PORT, **kwargs)
+            wakeonlan.send_magic_packet(
+                MAC_ADDRESS, ip_address=WOL_HOST, port=WOL_PORT, **kwargs
+            )
         except Exception as e:
             log(f"⚠️ Failed to send WoL packet: {e}")
 
@@ -125,6 +184,18 @@ async def shutdown():
     await client.aclose()
 
 
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for the proxy itself."""
+    return {
+        "status": "ok",
+        "target_is_up": target_is_up,
+        "target_last_checked_at": (
+            target_last_checked_at.isoformat() if target_last_checked_at else None
+        ),
+    }
+
+
 @app.api_route("/{path:path}", include_in_schema=False)
 async def proxy(request: Request, path: str):
     if not MAC_ADDRESS or not HEALTH_URL:
@@ -132,6 +203,17 @@ async def proxy(request: Request, path: str):
             status_code=500,
             content={"error": "MAC_ADDRESS and/or HEALTH_URL not configured"},
         )
+
+    target_url = build_url_from_parts(_target_parsed)
+
+    # Preserve original query parameters (from request, not parsed URL)
+    query_params = dict(request.query_params)
+
+    headers = {
+        k: v
+        for k, v in request.headers.items()
+        if k.lower() not in {"host", "content-length"}
+    }
 
     # If target is down, wake it first
     if not target_is_up:
@@ -148,46 +230,21 @@ async def proxy(request: Request, path: str):
                 headers={"Retry-After": str(int(MAX_TIMEOUT))},
             )
 
-    # Build the target URL: HEALTH_URL + path (if needed), preserve query & body
-    target_url = HEALTH_URL.rstrip("/") + "/" + path.lstrip("/")
-
-    # Extract query params, headers, and body from original request
-    query_params = dict(request.query_params)
-    headers = {
-        k: v
-        for k, v in request.headers.items()
-        if k.lower() not in {"host", "content-length"}
-    }
-
     try:
         # Get method and build async call
         method = request.method
-        if method == "HEAD":
-            # httpx doesn't support HEAD with body; skip it safely
-            resp = await client.head(
-                target_url,
-                params=query_params,
-                headers=headers,
-                timeout=httpx.Timeout(MAX_TIMEOUT),
-            )
-        else:
-            # Read body (even for GET/HEAD in FastAPI) to forward raw bytes if needed
-            body = await request.body()
-            kwargs = {
-                "params": query_params,
-                "headers": headers,
-                "timeout": httpx.Timeout(MAX_TIMEOUT),
-            }
-            if method == "POST":
-                resp = await client.post(target_url, content=body, **kwargs)
-            elif method == "PUT":
-                resp = await client.put(target_url, content=body, **kwargs)
-            elif method == "PATCH":
-                resp = await client.patch(target_url, content=body, **kwargs)
-            elif method == "DELETE":
-                resp = await client.delete(target_url, **kwargs)
-            else:  # GET, OPTIONS, etc.
-                resp = await client.request(method, target_url, **kwargs)
+
+        # Read body (even for GET/HEAD in FastAPI) to forward raw bytes if needed
+        body = await request.body()
+        kwargs = {
+            "params": query_params,
+            "headers": headers,
+            "timeout": httpx.Timeout(MAX_TIMEOUT),
+        }
+        if method in ["POST", "PUT", "PATCH"]:
+            kwargs["content"] = body
+
+        resp = await client.request(method, target_url, **kwargs)
 
         return Response(
             content=resp.content,
@@ -204,17 +261,4 @@ async def proxy(request: Request, path: str):
 
 
 if __name__ == "__main__":
-    # Graceful shutdown handling (e.g., Ctrl+C in docker)
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    def signal_handler(sig, frame):
-        log("Received SIGTERM/SIGINT; initiating shutdown...")
-        shutdown_event.set()
-
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
-
-    uvicorn.run(
-        app, host=HOST, port=PORT, log_level="info"
-    )
+    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
