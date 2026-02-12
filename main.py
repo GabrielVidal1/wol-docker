@@ -1,226 +1,245 @@
 import asyncio
+import json
 import os
-import sys
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from typing import Optional
+from urllib.parse import urljoin, urlparse
 
 import httpx
 import uvicorn
 import wakeonlan
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
-# Configuration from environment variables
+# ----------------------------
+# Configuration (env vars)
+# ----------------------------
 MAC_ADDRESS = os.getenv("MAC_ADDRESS")
-HEALTH_URL = os.getenv("HEALTH_URL")  # e.g., "http://192.168.1.50/api/health"
-TARGET_URL = os.getenv("TARGET_URL", HEALTH_URL)  # default to HEALTH_URL if not set
-MAX_TIMEOUT = float(os.getenv("MAX_TIMEOUT", "30"))  # Default: 30 seconds
+HEALTH_URL = os.getenv("HEALTH_URL")  # e.g. "http://192.168.1.50/api/health"
+TARGET_URL = (
+    os.getenv("TARGET_URL") or HEALTH_URL
+)  # base target URL (defaults to HEALTH_URL)
+MAX_TIMEOUT = float(os.getenv("MAX_TIMEOUT", "30"))  # seconds
 PORT = int(os.getenv("PORT", "8000"))
 HOST = os.getenv("HOST", "0.0.0.0")
-POLL_INTERVAL = 1.0  # Fixed at 1s as per request
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "5.0"))  # seconds
 
 WOL_HOST = os.getenv("WOL_HOST", "255.255.255.255")
 WOL_PORT = int(os.getenv("WOL_PORT", "9"))
 WOL_INTERFACE = os.getenv("WOL_INTERFACE") or None
 
-# State management
-target_is_up = False
-target_last_checked_at = None
-wake_lock = asyncio.Lock()  # To prevent concurrent wake-ups
-shutdown_event = asyncio.Event()
 
-app = FastAPI(title="Wake-on-LAN Proxy")
-
-client = httpx.AsyncClient(
-    timeout=httpx.Timeout(MAX_TIMEOUT, connect=10.0),
-    limits=httpx.Limits(max_keepalive_connections=10),
-)
-
-
-def log(message: str):
-    """Simple logger with UTC timestamp."""
+# ----------------------------
+# Helpers
+# ----------------------------
+def log(message: str) -> None:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     print(f"[{ts}] {message}", flush=True)
 
 
-def parse_url_with_port(url_str: str) -> dict:
-    """
-    Parse a URL and return components with explicit port (or None if not present).
-    Handles both `http://host` and `http://host:port`.
-    Returns: {'scheme':..., 'hostname':..., 'path':..., 'query':..., 'port': int|None}
-    """
-    try:
-        parsed = urlparse(url_str)
-        scheme = parsed.scheme or "http"
-        hostname = parsed.hostname
-        # Default ports: 80 for http, 443 for https — but we keep port=None if omitted in URL.
-        port = parsed.port
-        path = parsed.path or "/"
-        query = parsed.query
-
-        return {
-            "scheme": scheme,
-            "hostname": hostname,
-            "port": port,  # e.g., 8080, or None if not specified
-            "path": path.rstrip("/")
-            or "/",  # ensure trailing slash is handled consistently
-            "query": query,
-        }
-    except Exception as e:
-        raise ValueError(f"Invalid URL: {url_str} ({e})")
+def validate_url(name: str, value: Optional[str]) -> str:
+    if not value:
+        raise ValueError(f"{name} is not set")
+    parsed = urlparse(value)
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError(
+            f"{name} must be an absolute URL like http(s)://host[:port]/path (got: {value})"
+        )
+    return value
 
 
-def build_url_from_parts(parts: dict) -> str:
-    """Reconstruct URL from parsed parts, handling port and path correctly."""
-    scheme = parts["scheme"]
-    hostname = parts["hostname"]
-    path = parts["path"].rstrip("/") or "/"
-
-    # Port is only included if explicitly set
-    host_with_port = f"{hostname}:{parts['port']}" if parts.get("port") else hostname
-
-    # Rebuild without trailing slash in path (except root)
-    return f"{scheme}://{host_with_port}{path}"
+def build_target_request_url(base: str, path: str) -> str:
+    # Join base + path safely (handles missing/extra slashes)
+    base = base.rstrip("/") + "/"
+    path = path.lstrip("/")
+    return urljoin(base, path)
 
 
-# Pre-parse URLs at startup to catch errors early and avoid per-request parsing
-try:
-    _health_parsed = parse_url_with_port(HEALTH_URL) if HEALTH_URL else None
-    _target_parsed = parse_url_with_port(TARGET_URL) if TARGET_URL else None
+def remove_hop_hop_headers(headers: httpx.Headers) -> dict:
 
-    # Warn if health or target missing critical fields
-    for name, parts in [("HEALTH_URL", _health_parsed), ("TARGET_URL", _target_parsed)]:
-        if not parts or not parts["hostname"]:
-            raise ValueError(f"{name} is invalid: must contain a hostname")
-except Exception as e:
-    log(f"❌ Critical URL parse error: {e}")
-    sys.exit(1)
+    HOP_BY_HOP_HEADERS = {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+    }
+
+    res = {}
+    for k, v in headers.items():
+        if k.lower() in HOP_BY_HOP_HEADERS:
+            continue
+        res[k] = v
+    return res
 
 
-async def poll_health():
-    """
-    Poll `HEALTH_URL` every POLL_INTERVAL seconds.
-    Sets target_is_up to True once a 2xx or 3xx response is received.
-    On failure, resets target_is_up to False.
-    """
-    global target_is_up
-    global target_last_checked_at
+# ----------------------------
+# FastAPI app + lifespan
+# ----------------------------
+app = FastAPI(title="Wake-on-LAN Proxy")
 
-    health_url = build_url_from_parts(_health_parsed)
-    log(f"Starting health poll loop for {health_url}")
 
+async def poll_health(app_: FastAPI) -> None:
+    health_url = app_.state.health_url
+    target_up_event: asyncio.Event = app_.state.target_up_event
+    shutdown_event: asyncio.Event = app_.state.shutdown_event
+    client: httpx.AsyncClient = app_.state.client
+
+    log(f"Starting health poll loop: {health_url} (interval={POLL_INTERVAL}s)")
+
+    was_up = False
     while not shutdown_event.is_set():
         try:
-            async with httpx.AsyncClient(timeout=2.0) as short_client:
-                resp = await short_client.get(health_url)
-                if 200 <= resp.status_code < 400:
-                    if not target_is_up:
-                        log("✅ Target is now UP (health check passed)")
-                    target_is_up = True
-                else:
-                    raise httpx.HTTPStatusError(
-                        f"Unexpected status: {resp.status_code}",
-                        request=resp.request,
-                        response=resp,
+            resp = await client.get(
+                health_url,
+                timeout=httpx.Timeout(
+                    2.0,
+                    connect=2.0,
+                ),
+            )
+            is_up = resp.status_code != 503
+            if is_up:
+                target_up_event.set()
+                if not was_up:
+                    log("✅ Target is now UP")
+            else:
+                target_up_event.clear()
+                if was_up:
+                    log(
+                        f"⚠️ Health check status={resp.status_code}; marking target DOWN"
                     )
+            was_up = is_up
         except Exception as e:
-            if target_is_up:
-                log(f"⚠️ Health check failed ({e}); marking target DOWN")
-            target_is_up = False
+            target_up_event.clear()
+            if was_up:
+                log(
+                    f"⚠️ Health check failed ({type(e).__name__}: {e}); marking target DOWN"
+                )
+            was_up = False
 
-        target_last_checked_at = datetime.now(timezone.utc)
-        # Use asyncio.sleep() instead of time.sleep()
+        app_.state.target_last_checked_at = datetime.now(timezone.utc)
         await asyncio.sleep(POLL_INTERVAL)
 
 
-async def ensure_target_woken():
-    """
-    Ensure the target computer is awake (send WoL packet and wait for health check).
-    Returns True if target is up before timeout; False otherwise.
-    """
-    global target_is_up
+async def ensure_target_woken(app_: FastAPI) -> bool:
+    target_up_event: asyncio.Event = app_.state.target_up_event
+    wake_lock: asyncio.Lock = app_.state.wake_lock
+
+    # Fast path
+    if target_up_event.is_set():
+        return True
 
     async with wake_lock:
-        # If already up, nothing to do
-        if target_is_up:
+        # Re-check after acquiring lock
+        if target_up_event.is_set():
             return True
 
-        log(f" waking target ({MAC_ADDRESS})...")
+        log(f"🌙 Target is DOWN; sending WoL packet to {app_.state.mac_address} ...")
+
         try:
             kwargs = {}
             if WOL_INTERFACE:
                 kwargs["interface"] = WOL_INTERFACE
             wakeonlan.send_magic_packet(
-                MAC_ADDRESS, ip_address=WOL_HOST, port=WOL_PORT, **kwargs
+                app_.state.mac_address,
+                ip_address=WOL_HOST,
+                port=WOL_PORT,
+                **kwargs,
             )
         except Exception as e:
-            log(f"⚠️ Failed to send WoL packet: {e}")
+            log(f"⚠️ Failed to send WoL packet ({type(e).__name__}: {e})")
 
-        # Wait up to MAX_TIMEOUT seconds for health check to succeed
-        deadline = asyncio.get_event_loop().time() + MAX_TIMEOUT
-
-        while asyncio.get_event_loop().time() < deadline:
-            if target_is_up:
-                return True
-            await asyncio.sleep(0.1)
-
-        log("❌ Wake timeout exceeded.")
-        return False
+        # Wait until health poll marks it up (or timeout)
+        try:
+            await asyncio.wait_for(target_up_event.wait(), timeout=MAX_TIMEOUT)
+            return True
+        except asyncio.TimeoutError:
+            log("❌ Wake timeout exceeded (target did not become healthy in time).")
+            return False
 
 
 @app.on_event("startup")
-async def startup():
-    # Start health poll background task
-    task = asyncio.create_task(poll_health())
-    # Optional: keep reference to avoid GC issues in some Python versions
-    asyncio.gather(task)
+async def startup() -> None:
+    try:
+        # Validate config early
+        app.state.mac_address = MAC_ADDRESS
+        app.state.health_url = validate_url("HEALTH_URL", HEALTH_URL)
+        app.state.target_base_url = validate_url("TARGET_URL", TARGET_URL)
+
+        if not app.state.mac_address:
+            raise ValueError("MAC_ADDRESS is not set")
+
+        # Async primitives must be created inside the running event loop
+        app.state.shutdown_event = asyncio.Event()
+        app.state.target_up_event = asyncio.Event()
+        app.state.wake_lock = asyncio.Lock()
+        app.state.target_last_checked_at = None
+
+        # One shared HTTP client (connection pooled)
+        app.state.client = httpx.AsyncClient(
+            timeout=httpx.Timeout(MAX_TIMEOUT, connect=10.0),
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+            follow_redirects=False,
+        )
+
+        # Start background health poll
+        app.state.health_task = asyncio.create_task(poll_health(app))
+
+        log("✅ Startup complete")
+    except Exception as e:
+        log(f"❌ Startup error: {e}")
+        # Hard fail so container/orchestrator restarts quickly rather than serving a broken app
+        raise
 
 
 @app.on_event("shutdown")
-async def shutdown():
-    global client
+async def shutdown() -> None:
     log("Shutting down...")
-    shutdown_event.set()
-    await client.aclose()
+    app.state.shutdown_event.set()
+
+    task = getattr(app.state, "health_task", None)
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log(
+                f"⚠️ Health task ended with error during shutdown: {type(e).__name__}: {e}"
+            )
+
+    client: httpx.AsyncClient = getattr(app.state, "client", None)
+    if client:
+        await client.aclose()
 
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint for the proxy itself."""
-    return {
-        "status": "ok",
-        "target_is_up": target_is_up,
-        "target_last_checked_at": (
-            target_last_checked_at.isoformat() if target_last_checked_at else None
-        ),
-    }
-
-
-@app.api_route("/{path:path}", include_in_schema=False)
+# ----------------------------
+# Proxy endpoint (catch-all)
+# ----------------------------
+@app.api_route(
+    "/{path:path}",
+    include_in_schema=False,
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"],
+)
 async def proxy(request: Request, path: str):
-    if not MAC_ADDRESS or not HEALTH_URL:
+    # Sanity check (should not happen if startup succeeded)
+    if not getattr(app.state, "mac_address", None) or not getattr(
+        app.state, "health_url", None
+    ):
         return JSONResponse(
             status_code=500,
             content={"error": "MAC_ADDRESS and/or HEALTH_URL not configured"},
         )
 
-    target_url = build_url_from_parts(_target_parsed)
-
-    # Preserve original query parameters (from request, not parsed URL)
-    query_params = dict(request.query_params)
-
-    headers = {
-        k: v
-        for k, v in request.headers.items()
-        if k.lower() not in {"host", "content-length"}
-    }
-
-    # If target is down, wake it first
-    if not target_is_up:
-        log(
-            f"Target is DOWN; attempting to wake before request: {request.method} /{path}"
-        )
-        if not await ensure_target_woken():
+    # Ensure target is awake
+    if not app.state.target_up_event.is_set():
+        log(f"Target is DOWN; attempting wake before request: {request.method} /{path}")
+        ok = await ensure_target_woken(app)
+        if not ok:
             return JSONResponse(
                 status_code=503,
                 content={
@@ -230,35 +249,83 @@ async def proxy(request: Request, path: str):
                 headers={"Retry-After": str(int(MAX_TIMEOUT))},
             )
 
+    # Build upstream request
+    upstream_url = build_target_request_url(app.state.target_base_url, path)
+    body = await request.body()
+    query_params = dict(request.query_params)
+
     try:
-        # Get method and build async call
-        method = request.method
+        upstream_request = app.state.client.build_request(
+            method=request.method,
+            url=upstream_url,
+            params=query_params,
+            headers=remove_hop_hop_headers(request.headers),
+            content=body if body else None,
+        )
 
-        # Read body (even for GET/HEAD in FastAPI) to forward raw bytes if needed
-        body = await request.body()
-        kwargs = {
-            "params": query_params,
-            "headers": headers,
-            "timeout": httpx.Timeout(MAX_TIMEOUT),
-        }
-        if method in ["POST", "PUT", "PATCH"]:
-            kwargs["content"] = body
+        upstream_response = await app.state.client.send(
+            upstream_request,
+            stream=True,
+        )
 
-        resp = await client.request(method, target_url, **kwargs)
+        content_type = upstream_response.headers.get("content-type", "")
+        is_upstream_stream = "text/event-stream" in content_type.lower()
+
+        # Detect client-requested streaming (OpenAI style)
+        is_client_stream = False
+        if body:
+            try:
+                payload = json.loads(body)
+                if isinstance(payload, dict) and payload.get("stream") is True:
+                    is_client_stream = True
+            except Exception:
+                pass
+
+        if is_client_stream or is_upstream_stream:
+
+            async def stream_generator():
+                try:
+                    async for chunk in upstream_response.aiter_raw():
+                        yield chunk
+                finally:
+                    await upstream_response.aclose()
+
+            response_headers = remove_hop_hop_headers(upstream_response.headers)
+
+            response_headers.setdefault("Cache-Control", "no-cache")
+            return StreamingResponse(
+                stream_generator(),
+                status_code=upstream_response.status_code,
+                media_type=content_type or None,
+                headers=response_headers,
+            )
+
+        content = await upstream_response.aread()
+        await upstream_response.aclose()
 
         return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            headers=dict(resp.headers),
+            content=content,
+            status_code=upstream_response.status_code,
+            headers=remove_hop_hop_headers(upstream_response.headers),
         )
 
     except httpx.TimeoutException:
-        log(f"Timeout forwarding request to {target_url}")
-        return JSONResponse(status_code=504, content={"error": "Target timeout"})
+        log(f"⏱️ Timeout forwarding request to {upstream_url}")
+        return JSONResponse(
+            status_code=504,
+            content={"error": "Target timeout"},
+        )
+
     except Exception as e:
-        log(f"Error proxying request: {e}")
-        return JSONResponse(status_code=502, content={"error": str(e)})
+        log(f"❌ Error proxying request to {upstream_url}: {type(e).__name__}: {e}")
+        return JSONResponse(
+            status_code=502,
+            content={"error": str(e)},
+        )
 
 
+# ----------------------------
+# Entrypoint
+# ----------------------------
 if __name__ == "__main__":
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")

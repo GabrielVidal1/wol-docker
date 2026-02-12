@@ -2,10 +2,7 @@ version: "3.8"
 services:
   wol-proxy:
     build: .
-    environment:
-      MAC_ADDRESS: "aa:bb:cc:dd:ee:ff"
-      HEALTH_URL: "http://192.168.1.50/api/health"
-      MAX_TIMEOUT: "45" # optional
-    ports:
-      - "8000:8000"
+    env_file:
+      - .env
     restart: unless-stopped
+    network_mode: host
